@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -18,15 +17,6 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("main")
-
-
-def required_env(name):
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(
-            f"Не задана переменная Render: {name}"
-        )
-    return value
 
 
 async def health(request):
@@ -54,16 +44,33 @@ async def start_health_server():
 
     await site.start()
 
-    log.info("Health server запущен: %s", port)
+    log.info("Health server запущен на порту %s", port)
 
     return runner
 
 
 async def main():
-    api_id = int(required_env("API_ID"))
-    api_hash = required_env("API_HASH")
-    session_string = required_env("TG_SESSION")
-    bot_token = required_env("BOT_TOKEN")
+    required = [
+        "API_ID",
+        "API_HASH",
+        "TG_SESSION",
+        "BOT_TOKEN",
+    ]
+
+    missing = [
+        name for name in required
+        if not os.getenv(name)
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Не заданы переменные Render: " + ", ".join(missing)
+        )
+
+    api_id = int(os.environ["API_ID"])
+    api_hash = os.environ["API_HASH"]
+    session_string = os.environ["TG_SESSION"]
+    bot_token = os.environ["BOT_TOKEN"]
 
     database.init_db()
 
@@ -75,46 +82,66 @@ async def main():
 
     bot = Bot(token=bot_token)
 
-    await user_client.connect()
-
-    if not await user_client.is_user_authorized():
-        await user_client.disconnect()
-        raise RuntimeError(
-            "Telegram-сессия не авторизована."
-        )
-
-    me = await user_client.get_me()
-
-    log.info(
-        "Telegram подключён: %s",
-        getattr(me, "username", None) or me.id
-    )
-
-    await bot.initialize()
-
-    health_runner = await start_health_server()
-
-    scanner_task = asyncio.create_task(
-        run_scanner(user_client, bot),
-        name="gift-scanner"
-    )
+    health_runner = None
+    scanner_task = None
 
     try:
+        log.info("Подключение Telethon...")
+
+        await user_client.start()
+
+        if not await user_client.is_user_authorized():
+            raise RuntimeError(
+                "Telethon-сессия не авторизована"
+            )
+
+        me = await user_client.get_me()
+
+        log.info(
+            "Telethon подключен: @%s | ID: %s",
+            me.username,
+            me.id
+        )
+
+        await bot.initialize()
+
+        bot_info = await bot.get_me()
+
+        log.info(
+            "Бот подключен: @%s | ID: %s",
+            bot_info.username,
+            bot_info.id
+        )
+
+        health_runner = await start_health_server()
+
+        scanner_task = asyncio.create_task(
+            run_scanner(user_client, bot)
+        )
+
+        log.info("NFT Gift Tracker запущен")
+
         await scanner_task
 
     finally:
-        scanner_task.cancel()
+        if scanner_task:
+            scanner_task.cancel()
+            try:
+                await scanner_task
+            except asyncio.CancelledError:
+                pass
+
+        if health_runner:
+            await health_runner.cleanup()
 
         try:
-            await scanner_task
-        except asyncio.CancelledError:
+            await bot.shutdown()
+        except Exception:
             pass
 
-        await health_runner.cleanup()
-        await bot.shutdown()
         await user_client.disconnect()
 
-        log.info("Трекер остановлен")
+        log.info("NFT Gift Tracker остановлен")
 
 
 if __name__ == "__main__":
