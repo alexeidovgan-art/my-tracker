@@ -1,3 +1,4 @@
+
 import asyncio
 import html
 import logging
@@ -16,19 +17,19 @@ log = logging.getLogger("scanner")
 GROUP_ID = -1005907973030
 
 TOPIC_NAMES = {
-    "cheap": "дешевые",
-    "medium": "средние",
-    "expensive": "дорогие",
+    "cheap": "ширп",
+    "medium": "средняк",
+    "expensive": "на богатом",
 }
 
 PAGE_SIZE = 100
 SCAN_INTERVAL = 60
-PRICER_DELAY = 2.5
 
 PRICE_CHEAP = 10
 PRICE_MEDIUM = 50
 
 PRICER_USERNAME = "PriceNFTbot"
+PRICER_DELAY = 2.5
 
 
 def clean(value):
@@ -58,10 +59,12 @@ def get_gift_key(gift):
 
 def get_gift_url(gift):
     slug = get_value(gift, "slug")
+
     if slug:
         return f"https://t.me/nft/{slug}"
 
     gift_id = get_value(gift, "id")
+
     if gift_id:
         return f"https://t.me/nft/{gift_id}"
 
@@ -77,6 +80,7 @@ def get_attributes(gift):
 
     for attr in get_value(gift, "attributes") or []:
         class_name = attr.__class__.__name__.lower()
+
         name_obj = get_value(attr, "name")
         name = get_value(name_obj, "text") or clean(name_obj)
 
@@ -153,6 +157,7 @@ def extract_floor(text):
 
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
+
         if match:
             try:
                 return float(match.group(1).replace(",", "."))
@@ -174,11 +179,11 @@ async def ask_pricer(client, gift_url):
             await conv.send_message(gift_url)
             response = await conv.get_response()
 
-            text = response.raw_text or ""
-            return extract_floor(text)
+            return extract_floor(response.raw_text or "")
 
     except asyncio.TimeoutError:
-        log.warning("PriceNFTbot не ответил на %s", gift_url)
+        log.warning("PriceNFTbot не ответил: %s", gift_url)
+
     except Exception:
         log.exception("Ошибка обращения к PriceNFTbot")
 
@@ -232,7 +237,8 @@ async def discover_topics(client):
                 topics[key] = topic.id
 
     missing = [
-        name for key, name in TOPIC_NAMES.items()
+        name
+        for key, name in TOPIC_NAMES.items()
         if key not in topics
     ]
 
@@ -240,6 +246,8 @@ async def discover_topics(client):
         raise RuntimeError(
             "В группе не найдены темы: " + ", ".join(missing)
         )
+
+    log.info("Все три темы успешно найдены: %s", topics)
 
     return topics
 
@@ -252,7 +260,10 @@ def make_listing(data):
     owner_url = data.get("owner_url")
 
     if owner_url:
-        owner_line = f'<a href="{html.escape(owner_url, quote=True)}">{owner}</a>'
+        owner_line = (
+            f'<a href="{html.escape(owner_url, quote=True)}">'
+            f'{owner}</a>'
+        )
     else:
         owner_line = owner
 
@@ -264,8 +275,8 @@ def make_listing(data):
         f"🖼 Фон: {esc(data['backdrop'])}\n"
         f"🔣 Узор: {esc(data['pattern'])}\n\n"
         f"👤 Владелец: {owner_line}\n\n"
-        f'🔗 <a href="{html.escape(data["gift_url"], quote=True)}">'
-        f"Открыть подарок</a>"
+        f'<a href="{html.escape(data["gift_url"], quote=True)}">'
+        f'Открыть подарок</a>'
     )
 
 
@@ -285,7 +296,7 @@ async def publish_gift(client, bot, gift, users, topics):
     price = get_ton_price(gift)
 
     if price is None:
-        log.info("Пропущен подарок без цены в TON: %s", gift_key)
+        log.info("Пропущен подарок без цены TON: %s", gift_key)
         return
 
     attrs = get_attributes(gift)
@@ -302,7 +313,7 @@ async def publish_gift(client, bot, gift, users, topics):
 
     if floor is None:
         log.warning(
-            "Не удалось получить floor от PriceNFTbot: %s",
+            "Не удалось получить floor: %s",
             gift_url
         )
         return
@@ -371,13 +382,16 @@ async def scan_collection(client, bot, base_gift, topics):
             )
 
         except FloodWaitError as error:
-            log.warning("FloodWait: ожидание %s секунд", error.seconds)
+            log.warning(
+                "FloodWait: ожидание %s секунд",
+                error.seconds
+            )
             await asyncio.sleep(error.seconds + 1)
             continue
 
         except Exception:
             log.exception(
-                "Ошибка получения перепродаж для gift_id=%s",
+                "Ошибка получения перепродаж gift_id=%s",
                 base_gift_id
             )
             return
@@ -414,7 +428,10 @@ async def scan_once(client, bot):
 
     base_gifts = getattr(result, "gifts", []) or []
 
-    log.info("Найдено типов подарков: %s", len(base_gifts))
+    log.info(
+        "Найдено типов подарков: %s",
+        len(base_gifts)
+    )
 
     for base_gift in base_gifts:
         try:
@@ -424,9 +441,14 @@ async def scan_once(client, bot):
                 base_gift,
                 topics
             )
+
         except FloodWaitError as error:
-            log.warning("FloodWait: %s секунд", error.seconds)
+            log.warning(
+                "FloodWait: %s секунд",
+                error.seconds
+            )
             await asyncio.sleep(error.seconds + 1)
+
         except Exception:
             log.exception("Ошибка обработки типа подарка")
 
@@ -439,8 +461,10 @@ async def run_scanner(client, bot):
     while True:
         try:
             await scan_once(client, bot)
+
         except asyncio.CancelledError:
             raise
+
         except Exception:
             log.exception("Ошибка основного цикла сканера")
 
