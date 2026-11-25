@@ -47,7 +47,6 @@ def init_db():
         }
 
         migrations = {
-            "id": "INTEGER",
             "owner_id": "INTEGER",
             "claimed_by": "INTEGER",
             "claimed_at": "TEXT",
@@ -62,8 +61,15 @@ def init_db():
                 )
 
         conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_gifts_id
-            ON gifts(id)
+            CREATE TABLE IF NOT EXISTS log_ids (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                gift_key TEXT UNIQUE NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            INSERT OR IGNORE INTO log_ids (gift_key)
+            SELECT gift_key FROM gifts
         """)
 
         conn.execute("""
@@ -80,7 +86,6 @@ def init_db():
             )
         """)
 
-        # Старые опубликованные подарки тоже считаем уже встреченными.
         conn.execute("""
             INSERT OR IGNORE INTO seen_gifts (gift_key, first_seen)
             SELECT gift_key, COALESCE(published_at, ?)
@@ -162,10 +167,16 @@ def save_gift(data):
             now()
         ))
 
-        row = conn.execute(
-            "SELECT id FROM gifts WHERE gift_key = ?",
-            (str(data["gift_key"]),)
-        ).fetchone()
+        conn.execute("""
+            INSERT OR IGNORE INTO log_ids (gift_key)
+            VALUES (?)
+        """, (str(data["gift_key"]),))
+
+        row = conn.execute("""
+            SELECT id
+            FROM log_ids
+            WHERE gift_key = ?
+        """, (str(data["gift_key"]),)).fetchone()
 
         conn.commit()
 
@@ -174,36 +185,58 @@ def save_gift(data):
 
 def delete_unclaimed_gift(gift_id):
     with connection() as conn:
-        conn.execute("""
-            DELETE FROM gifts
-            WHERE id = ? AND claimed_by IS NULL
-        """, (int(gift_id),))
+        row = conn.execute(
+            "SELECT gift_key FROM log_ids WHERE id = ?",
+            (int(gift_id),)
+        ).fetchone()
+
+        if row:
+            key = row["gift_key"]
+
+            conn.execute("""
+                DELETE FROM gifts
+                WHERE gift_key = ? AND claimed_by IS NULL
+            """, (key,))
+
+            conn.execute(
+                "DELETE FROM log_ids WHERE id = ?",
+                (int(gift_id),)
+            )
+
         conn.commit()
 
 
 def set_group_message(gift_id, chat_id, message_id):
     with connection() as conn:
-        conn.execute("""
-            UPDATE gifts
-            SET group_chat_id = ?, group_message_id = ?
-            WHERE id = ?
-        """, (int(chat_id), int(message_id), int(gift_id)))
+        row = conn.execute(
+            "SELECT gift_key FROM log_ids WHERE id = ?",
+            (int(gift_id),)
+        ).fetchone()
+
+        if row:
+            conn.execute("""
+                UPDATE gifts
+                SET group_chat_id = ?, group_message_id = ?
+                WHERE gift_key = ?
+            """, (
+                int(chat_id),
+                int(message_id),
+                row["gift_key"]
+            ))
+
         conn.commit()
 
 
 def claim_gift(gift_id, user_id):
-    """
-    Атомарное занятие лога.
-    Из двух одновременных нажатий победит только одно.
-    """
-
     with connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
 
         row = conn.execute("""
-            SELECT *
-            FROM gifts
-            WHERE id = ? AND claimed_by IS NULL
+            SELECT gifts.*, log_ids.id AS log_id
+            FROM log_ids
+            JOIN gifts ON gifts.gift_key = log_ids.gift_key
+            WHERE log_ids.id = ?
+              AND gifts.claimed_by IS NULL
         """, (int(gift_id),)).fetchone()
 
         if row is None:
@@ -213,14 +246,18 @@ def claim_gift(gift_id, user_id):
         conn.execute("""
             UPDATE gifts
             SET claimed_by = ?, claimed_at = ?
-            WHERE id = ? AND claimed_by IS NULL
-        """, (int(user_id), now(), int(gift_id)))
+            WHERE gift_key = ? AND claimed_by IS NULL
+        """, (
+            int(user_id),
+            now(),
+            row["gift_key"]
+        ))
 
-        updated = conn.execute(
+        changed = conn.execute(
             "SELECT changes() AS changed"
         ).fetchone()["changed"]
 
-        if updated != 1:
+        if changed != 1:
             conn.commit()
             return None
 
@@ -232,14 +269,20 @@ def claim_gift(gift_id, user_id):
 
 
 def release_claim(gift_id, user_id):
-    """
-    Освобождает лог, если Telegram не смог отправить личное сообщение.
-    """
-
     with connection() as conn:
-        conn.execute("""
-            UPDATE gifts
-            SET claimed_by = NULL, claimed_at = NULL
-            WHERE id = ? AND claimed_by = ?
-        """, (int(gift_id), int(user_id)))
+        row = conn.execute(
+            "SELECT gift_key FROM log_ids WHERE id = ?",
+            (int(gift_id),)
+        ).fetchone()
+
+        if row:
+            conn.execute("""
+                UPDATE gifts
+                SET claimed_by = NULL, claimed_at = NULL
+                WHERE gift_key = ? AND claimed_by = ?
+            """, (
+                row["gift_key"],
+                int(user_id)
+            ))
+
         conn.commit()
