@@ -1,155 +1,144 @@
-
 import asyncio
 import html
 import logging
 import re
+import unicodedata
 
 from telethon import functions, types
-from telethon.errors import FloodWaitError
 from telethon.tl.functions.messages import GetForumTopicsRequest
+from telethon.errors import FloodWaitError
 
 import database
 
 
 log = logging.getLogger("scanner")
 
-# ID вашей форум-группы
-GROUP_ID = -1005741245874
+GROUP_ID = -1005907973030
 
-# Названия тем в группе
 TOPIC_NAMES = {
-    "cheap": "дешёвые",
+    "cheap": "дешевые",
     "medium": "средние",
     "expensive": "дорогие",
-    "premium": "премиум",
 }
-
-# Ценовые категории во FLOR, TON
-PRICE_CHEAP = 10
-PRICE_MEDIUM = 50
-PRICE_EXPENSIVE = 150
 
 PAGE_SIZE = 100
 SCAN_INTERVAL = 60
-PRICER_DELAY = 1.5
+PRICER_DELAY = 2.5
+
+PRICE_CHEAP = 10
+PRICE_MEDIUM = 50
+
+PRICER_USERNAME = "PriceNFTbot"
 
 
-def safe_text(value):
+def clean(value):
     if value is None:
-        return "Не указано"
-    return html.escape(str(value))
+        return ""
+    return str(value).strip()
 
 
-def get_gift_id(gift):
-    value = getattr(gift, "id", None)
+def normalize_topic(value):
+    value = clean(value).lower().replace("ё", "е")
+    value = unicodedata.normalize("NFKC", value)
+    return re.sub(r"\s+", " ", value)
+
+
+def get_value(obj, *names):
+    for name in names:
+        value = getattr(obj, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def get_gift_key(gift):
+    value = get_value(gift, "slug", "id")
     return str(value) if value is not None else None
 
 
-def get_gift_title(gift):
-    return (
-        getattr(gift, "title", None)
-        or getattr(gift, "name", None)
-        or "Telegram Gift"
-    )
-
-
 def get_gift_url(gift):
-    slug = getattr(gift, "slug", None)
-
+    slug = get_value(gift, "slug")
     if slug:
         return f"https://t.me/nft/{slug}"
 
-    gift_id = get_gift_id(gift)
+    gift_id = get_value(gift, "id")
     if gift_id:
         return f"https://t.me/nft/{gift_id}"
 
-    return "https://t.me/nft"
-
-
-def is_blockchain_gift(gift):
-    return bool(
-        getattr(gift, "gift_address", None)
-        or getattr(gift, "owner_address", None)
-    )
+    return ""
 
 
 def get_attributes(gift):
     result = {
-        "model": "Не указана",
-        "backdrop": "Не указан",
-        "pattern": "Не указан",
+        "model": "",
+        "backdrop": "",
+        "pattern": "",
     }
 
-    attributes = getattr(gift, "attributes", None) or []
+    for attr in get_value(gift, "attributes") or []:
+        class_name = attr.__class__.__name__.lower()
+        name_obj = get_value(attr, "name")
+        name = get_value(name_obj, "text") or clean(name_obj)
 
-    for attribute in attributes:
-        name = attribute.__class__.__name__
-        value = getattr(attribute, "name", None)
-
-        if hasattr(value, "text"):
-            value = value.text
-
-        if not value:
-            continue
-
-        if "Model" in name:
-            result["model"] = str(value)
-        elif "Backdrop" in name:
-            result["backdrop"] = str(value)
-        elif "Pattern" in name:
-            result["pattern"] = str(value)
+        if "model" in class_name:
+            result["model"] = name
+        elif "backdrop" in class_name:
+            result["backdrop"] = name
+        elif "pattern" in class_name:
+            result["pattern"] = name
 
     return result
 
 
+def is_blockchain_gift(gift):
+    return bool(
+        get_value(gift, "gift_address")
+        or get_value(gift, "owner_address")
+    )
+
+
 def get_owner(gift, users):
-    owner_peer = getattr(gift, "owner_id", None)
+    owner_id = get_value(gift, "owner_id")
 
-    if not isinstance(owner_peer, types.PeerUser):
-        return "Неизвестен", None
+    if isinstance(owner_id, types.PeerUser):
+        owner_id = owner_id.user_id
 
-    owner = next(
-        (
-            user for user in users
-            if getattr(user, "id", None) == owner_peer.user_id
-        ),
-        None,
-    )
+    if not owner_id:
+        return "Неизвестен", ""
 
-    if owner is None:
-        return (
-            f"ID {owner_peer.user_id}",
-            f"tg://user?id={owner_peer.user_id}",
-        )
+    for user in users or []:
+        if getattr(user, "id", None) == owner_id:
+            username = get_value(user, "username")
 
-    username = getattr(owner, "username", None)
+            if username:
+                return f"@{username}", f"https://t.me/{username}"
 
-    if username:
-        return f"@{username}", f"https://t.me/{username}"
+            return (
+                f"ID {owner_id}",
+                f"tg://user?id={owner_id}"
+            )
 
-    return (
-        f"ID {owner_peer.user_id}",
-        f"tg://user?id={owner_peer.user_id}",
-    )
+    return f"ID {owner_id}", f"tg://user?id={owner_id}"
 
 
-def get_price(gift):
-    amounts = getattr(gift, "resell_amount", None) or []
+def get_ton_price(gift):
+    amount = get_value(gift, "resell_amount")
 
-    for amount in amounts:
-        class_name = amount.__class__.__name__
-        value = getattr(amount, "amount", None)
+    if amount is None:
+        return None
 
-        if value is None:
-            continue
+    class_name = amount.__class__.__name__.lower()
 
-        if "Ton" in class_name:
-            return float(value) / 1_000_000_000, "TON"
+    if "ton" not in class_name:
+        return None
 
-        if "Stars" in class_name:
-            return float(value), "звёзд"
+    whole = get_value(amount, "amount") or 0
+    nanos = get_value(amount, "nanos") or 0
 
-    return None, None
+    try:
+        return float(whole) + float(nanos) / 1_000_000_000
+    except (TypeError, ValueError):
+        return None
 
 
 def extract_floor(text):
@@ -157,13 +146,13 @@ def extract_floor(text):
         return None
 
     patterns = [
-        r"(?:floor|флор)\D{0,20}([\d.,]+)\s*(?:ton|тон)",
-        r"([\d.,]+)\s*(?:ton|тон)\D{0,20}(?:floor|флор)",
+        r"floor(?:\s+price)?\s*[:：—-]?\s*([\d.,]+)\s*TON",
+        r"флор(?:\s+цена)?\s*[:：—-]?\s*([\d.,]+)\s*TON",
+        r"([\d.,]+)\s*TON\s*(?:floor|флор)",
     ]
 
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
-
         if match:
             try:
                 return float(match.group(1).replace(",", "."))
@@ -174,35 +163,31 @@ def extract_floor(text):
 
 
 async def ask_pricer(client, gift_url):
-    """
-    Запрашивает информацию у @PriceNFTbot.
-    Формат ответа зависит от самого бота.
-    """
+    if not gift_url:
+        return None
 
     try:
         async with client.conversation(
-            "@PriceNFTbot",
-            timeout=25,
-            exclusive=True,
-        ) as conversation:
+            PRICER_USERNAME,
+            timeout=30
+        ) as conv:
+            await conv.send_message(gift_url)
+            response = await conv.get_response()
 
-            await conversation.send_message(gift_url)
-            response = await conversation.get_response()
-
-            return response.raw_text or ""
+            text = response.raw_text or ""
+            return extract_floor(text)
 
     except asyncio.TimeoutError:
-        log.warning("PriceNFTbot не ответил: %s", gift_url)
-        return ""
-
+        log.warning("PriceNFTbot не ответил на %s", gift_url)
     except Exception:
-        log.exception("Ошибка запроса к PriceNFTbot")
-        return ""
+        log.exception("Ошибка обращения к PriceNFTbot")
+
+    return None
 
 
-def get_topic_for_floor(floor):
+def get_category(floor):
     if floor is None:
-        return "cheap"
+        return None
 
     if floor < PRICE_CHEAP:
         return "cheap"
@@ -210,58 +195,16 @@ def get_topic_for_floor(floor):
     if floor < PRICE_MEDIUM:
         return "medium"
 
-    if floor < PRICE_EXPENSIVE:
-        return "expensive"
-
-    return "premium"
-
-
-def make_listing(
-    gift,
-    gift_url,
-    owner_name,
-    owner_url,
-    price,
-    price_currency,
-    floor,
-    attributes,
-):
-    title = safe_text(get_gift_title(gift))
-    model = safe_text(attributes["model"])
-    backdrop = safe_text(attributes["backdrop"])
-    pattern = safe_text(attributes["pattern"])
-
-    if price is None:
-        price_text = "Не указана"
-    else:
-        price_text = f"{price:g} {price_currency}"
-
-    if floor is None:
-        floor_text = "Не удалось получить"
-    else:
-        floor_text = f"{floor:g} TON"
-
-    owner = safe_text(owner_name)
-
-    if owner_url:
-        owner_text = f'<a href="{html.escape(owner_url, quote=True)}">{owner}</a>'
-    else:
-        owner_text = owner
-
-    return (
-        f"🎁 <b>{title}</b>\n\n"
-        f"💰 <b>Цена:</b> {price_text}\n"
-        f"📊 <b>Флор коллекции:</b> {floor_text}\n\n"
-        f"👤 <b>Владелец:</b> {owner_text}\n\n"
-        f"🎨 <b>Модель:</b> {model}\n"
-        f"🖼 <b>Фон:</b> {backdrop}\n"
-        f"🔹 <b>Узор:</b> {pattern}\n\n"
-        f'🔗 <a href="{html.escape(gift_url, quote=True)}">Открыть подарок</a>'
-    )
+    return "expensive"
 
 
 async def discover_topics(client):
     entity = await client.get_entity(GROUP_ID)
+
+    log.info(
+        "Подключена группа: %s",
+        get_value(entity, "title") or GROUP_ID
+    )
 
     result = await client(
         GetForumTopicsRequest(
@@ -269,124 +212,152 @@ async def discover_topics(client):
             offset_date=0,
             offset_id=0,
             offset_topic=0,
-            limit=100,
+            limit=100
         )
     )
 
-    found = {}
+    topics = {}
 
-    for topic in result.topics:
-        name = topic.title.strip().casefold()
+    for topic in getattr(result, "topics", []):
+        title = normalize_topic(get_value(topic, "title"))
+
+        log.info(
+            "Найдена тема: %s | ID: %s",
+            title,
+            topic.id
+        )
 
         for key, expected_name in TOPIC_NAMES.items():
-            if name == expected_name:
-                found[key] = topic.id
+            if title == normalize_topic(expected_name):
+                topics[key] = topic.id
 
-    missing = set(TOPIC_NAMES) - set(found)
+    missing = [
+        name for key, name in TOPIC_NAMES.items()
+        if key not in topics
+    ]
 
     if missing:
         raise RuntimeError(
-            "Не найдены темы группы: "
-            + ", ".join(sorted(missing))
+            "В группе не найдены темы: " + ", ".join(missing)
         )
 
-    log.info("Темы группы найдены: %s", found)
-    return found
+    return topics
 
 
-async def publish_gift(client, bot, gift, topics, users):
-    gift_id = get_gift_id(gift)
+def make_listing(data):
+    def esc(value):
+        return html.escape(clean(value) or "Не указано")
 
-    if not gift_id:
-        return
+    owner = esc(data["owner"])
+    owner_url = data.get("owner_url")
 
-    # Не публикуем подарки, связанные с блокчейном
-    if is_blockchain_gift(gift):
-        log.info("Пропуск блокчейн-подарка: %s", gift_id)
-        return
+    if owner_url:
+        owner_line = f'<a href="{html.escape(owner_url, quote=True)}">{owner}</a>'
+    else:
+        owner_line = owner
 
-    # Не публикуем уже обработанные подарки
-    if database.gift_exists(gift_id):
-        return
-
-    gift_url = get_gift_url(gift)
-
-    attributes = get_attributes(gift)
-    owner_name, owner_url = get_owner(gift, users)
-    price, price_currency = get_price(gift)
-
-    # Запрашиваем флор у PriceNFTbot
-    pricer_text = await ask_pricer(client, gift_url)
-    floor = extract_floor(pricer_text)
-
-    await asyncio.sleep(PRICER_DELAY)
-
-    topic_key = get_topic_for_floor(floor)
-    topic_id = topics[topic_key]
-
-    message_text = make_listing(
-        gift=gift,
-        gift_url=gift_url,
-        owner_name=owner_name,
-        owner_url=owner_url,
-        price=price,
-        price_currency=price_currency,
-        floor=floor,
-        attributes=attributes,
+    return (
+        f"🎁 <b>{esc(data['title'])}</b>\n\n"
+        f"💰 Цена: <b>{data['price']:.3f} TON</b>\n"
+        f"📊 Floor: <b>{data['floor']:.3f} TON</b>\n\n"
+        f"🎨 Модель: {esc(data['model'])}\n"
+        f"🖼 Фон: {esc(data['backdrop'])}\n"
+        f"🔣 Узор: {esc(data['pattern'])}\n\n"
+        f"👤 Владелец: {owner_line}\n\n"
+        f'🔗 <a href="{html.escape(data["gift_url"], quote=True)}">'
+        f"Открыть подарок</a>"
     )
 
+
+async def publish_gift(client, bot, gift, users, topics):
+    if is_blockchain_gift(gift):
+        return
+
+    gift_key = get_gift_key(gift)
+    gift_url = get_gift_url(gift)
+
+    if not gift_key or not gift_url:
+        return
+
+    if database.gift_exists(gift_key):
+        return
+
+    price = get_ton_price(gift)
+
+    if price is None:
+        log.info("Пропущен подарок без цены в TON: %s", gift_key)
+        return
+
+    attrs = get_attributes(gift)
+    owner, owner_url = get_owner(gift, users)
+
+    title = (
+        attrs["model"]
+        or get_value(gift, "title")
+        or "Telegram Gift"
+    )
+
+    floor = await ask_pricer(client, gift_url)
+    await asyncio.sleep(PRICER_DELAY)
+
+    if floor is None:
+        log.warning(
+            "Не удалось получить floor от PriceNFTbot: %s",
+            gift_url
+        )
+        return
+
+    category = get_category(floor)
+
+    if category not in topics:
+        return
+
+    data = {
+        "gift_key": gift_key,
+        "gift_url": gift_url,
+        "title": title,
+        "owner": owner,
+        "owner_url": owner_url,
+        "price": price,
+        "floor": floor,
+        "model": attrs["model"],
+        "backdrop": attrs["backdrop"],
+        "pattern": attrs["pattern"],
+        "category": category,
+    }
+
+    message = make_listing(data)
+
     try:
-        message = await bot.send_message(
+        await bot.send_message(
             chat_id=GROUP_ID,
-            message_thread_id=topic_id,
-            text=message_text,
+            message_thread_id=topics[category],
+            text=message,
             parse_mode="HTML",
-            disable_web_page_preview=True,
+            disable_web_page_preview=True
         )
 
-        database.save_gift({
-            "gift_id": gift_id,
-            "title": get_gift_title(gift),
-            "gift_url": gift_url,
-            "owner_id": (
-                getattr(getattr(gift, "owner_id", None), "user_id", None)
-            ),
-            "owner_username": (
-                owner_name if owner_name.startswith("@") else None
-            ),
-            "owner_url": owner_url,
-            "price": price,
-            "floor": floor,
-            "model": attributes["model"],
-            "backdrop": attributes["backdrop"],
-            "pattern": attributes["pattern"],
-        })
-
-        database.mark_published(
-            gift_id,
-            topic_id,
-            message.message_id,
-        )
+        database.save_gift(data)
 
         log.info(
-            "Опубликован подарок %s в тему %s",
-            gift_id,
-            topic_key,
+            "Опубликован %s | цена %.3f TON | floor %.3f TON",
+            gift_key,
+            price,
+            floor
         )
 
     except Exception:
-        log.exception("Не удалось опубликовать подарок %s", gift_id)
+        log.exception("Ошибка публикации подарка %s", gift_key)
 
 
 async def scan_collection(client, bot, base_gift, topics):
-    base_gift_id = getattr(base_gift, "id", None)
+    base_gift_id = get_value(base_gift, "id")
 
-    if base_gift_id is None:
+    if not base_gift_id:
         return
 
     offset = ""
-    page_number = 0
-    total_found = 0
+    processed_offsets = set()
 
     while True:
         try:
@@ -395,70 +366,41 @@ async def scan_collection(client, bot, base_gift, topics):
                     gift_id=base_gift_id,
                     offset=offset,
                     limit=PAGE_SIZE,
-                    sort_by_price=True,
+                    sort_by_price=True
                 )
             )
 
         except FloodWaitError as error:
-            log.warning(
-                "Telegram FloodWait: пауза %s секунд",
-                error.seconds,
-            )
+            log.warning("FloodWait: ожидание %s секунд", error.seconds)
             await asyncio.sleep(error.seconds + 1)
             continue
 
         except Exception:
             log.exception(
-                "Ошибка получения коллекции %s",
-                base_gift_id,
+                "Ошибка получения перепродаж для gift_id=%s",
+                base_gift_id
             )
-            break
+            return
 
         gifts = getattr(result, "gifts", []) or []
         users = getattr(result, "users", []) or []
 
-        page_number += 1
-        total_found += len(gifts)
-
-        log.info(
-            "Коллекция %s: страница %s, подарков %s",
-            base_gift_id,
-            page_number,
-            len(gifts),
-        )
-
         for gift in gifts:
-            try:
-                await publish_gift(
-                    client,
-                    bot,
-                    gift,
-                    topics,
-                    users,
-                )
-
-            except FloodWaitError as error:
-                log.warning(
-                    "FloodWait при обработке подарка: %s секунд",
-                    error.seconds,
-                )
-                await asyncio.sleep(error.seconds + 1)
-
-            except Exception:
-                log.exception("Ошибка обработки подарка")
+            await publish_gift(
+                client,
+                bot,
+                gift,
+                users,
+                topics
+            )
 
         next_offset = getattr(result, "next_offset", None)
 
-        if not next_offset:
+        if not next_offset or next_offset in processed_offsets:
             break
 
+        processed_offsets.add(next_offset)
         offset = next_offset
-
-    log.info(
-        "Коллекция %s обработана. Всего найдено: %s",
-        base_gift_id,
-        total_found,
-    )
 
 
 async def scan_once(client, bot):
@@ -466,16 +408,13 @@ async def scan_once(client, bot):
 
     topics = await discover_topics(client)
 
-    catalog = await client(
+    result = await client(
         functions.payments.GetStarGiftsRequest(hash=0)
     )
 
-    base_gifts = getattr(catalog, "gifts", []) or []
+    base_gifts = getattr(result, "gifts", []) or []
 
-    log.info(
-        "Найдено коллекций в каталоге: %s",
-        len(base_gifts),
-    )
+    log.info("Найдено типов подарков: %s", len(base_gifts))
 
     for base_gift in base_gifts:
         try:
@@ -483,44 +422,26 @@ async def scan_once(client, bot):
                 client,
                 bot,
                 base_gift,
-                topics,
+                topics
             )
-
         except FloodWaitError as error:
-            log.warning(
-                "FloodWait при сканировании каталога: %s секунд",
-                error.seconds,
-            )
+            log.warning("FloodWait: %s секунд", error.seconds)
             await asyncio.sleep(error.seconds + 1)
-
         except Exception:
-            log.exception(
-                "Ошибка сканирования коллекции"
-            )
+            log.exception("Ошибка обработки типа подарка")
 
-    log.info("Сканирование каталога завершено")
+    log.info("Сканирование завершено")
 
 
 async def run_scanner(client, bot):
-    log.info("Сканер запущен")
+    database.init_db()
 
     while True:
         try:
             await scan_once(client, bot)
-
-        except FloodWaitError as error:
-            log.warning(
-                "FloodWait главного цикла: %s секунд",
-                error.seconds,
-            )
-            await asyncio.sleep(error.seconds + 1)
-
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            log.exception("Ошибка главного цикла")
-
-        log.info(
-            "Следующее сканирование через %s секунд",
-            SCAN_INTERVAL,
-        )
+            log.exception("Ошибка основного цикла сканера")
 
         await asyncio.sleep(SCAN_INTERVAL)
