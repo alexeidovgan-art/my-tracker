@@ -1,10 +1,12 @@
 
 import asyncio
 import logging
-import os
 import re
-from telethon import TelegramClient, functions, types
+import html
+
+from telethon import functions, types
 from telethon.errors import FloodWaitError
+from telegram import Bot
 
 import database
 
@@ -14,37 +16,33 @@ log = logging.getLogger("scanner")
 GROUP_ID = -1005741245874
 PRICER_USERNAME = "PriceNFTbot"
 
-TOPIC_NAMES = {
-    "cheap": ("дешёвые", 0, 10),
-    "medium": ("средние", 10, 50),
-    "expensive": ("дорогие", 50, 150),
-    "premium": ("премиум", 150, float("inf")),
-}
-
 SCAN_INTERVAL = 300
 PAGE_SIZE = 100
 
+TOPIC_NAMES = {
+    "cheap": "дешёвые",
+    "medium": "средние",
+    "expensive": "дорогие",
+    "premium": "премиум",
+}
+
 
 def get_topic_for_floor(floor):
-    if floor is None:
-        return "cheap"
-
-    if floor < 10:
+    if floor is None or floor < 10:
         return "cheap"
     if floor < 50:
         return "medium"
     if floor < 150:
         return "expensive"
-
     return "premium"
 
 
 async def discover_topics(client):
-    entity = await client.get_entity(GROUP_ID)
+    group = await client.get_entity(GROUP_ID)
 
     result = await client(
         functions.channels.GetForumTopicsRequest(
-            channel=entity,
+            channel=group,
             offset_date=None,
             offset_id=0,
             offset_topic=0,
@@ -57,7 +55,7 @@ async def discover_topics(client):
     for topic in result.topics:
         name = topic.title.strip().casefold()
 
-        for key, (expected, _, _) in TOPIC_NAMES.items():
+        for key, expected in TOPIC_NAMES.items():
             if name == expected:
                 found[key] = topic.id
 
@@ -65,14 +63,21 @@ async def discover_topics(client):
 
     if missing:
         raise RuntimeError(
-            "Не найдены темы группы: " + ", ".join(sorted(missing))
+            "Не найдены темы: " + ", ".join(sorted(missing))
         )
 
-    log.info("Темы найдены автоматически: %s", found)
+    log.info("Темы группы найдены: %s", found)
     return found
 
 
-def extract_attributes(gift):
+def is_blockchain_gift(gift):
+    return bool(
+        getattr(gift, "gift_address", None)
+        or getattr(gift, "owner_address", None)
+    )
+
+
+def get_attributes(gift):
     result = {
         "model": None,
         "backdrop": None,
@@ -100,48 +105,29 @@ def extract_attributes(gift):
     return result
 
 
-def get_gift_price(gift):
-    for amount in getattr(gift, "resell_amount", []) or []:
-        name = type(amount).__name__
-
-        if name == "StarsTonAmount":
-            value = getattr(amount, "amount", None)
-
-            if value is not None:
-                return f"{value / 1_000_000_000:.4f} TON"
-
-        elif name == "StarsAmount":
-            value = getattr(amount, "amount", None)
-
-            if value is not None:
-                return f"{value} ⭐"
-
-    return "Цена не определена"
-
-
 def get_owner(gift, users):
     owner = getattr(gift, "owner_id", None)
 
     if not isinstance(owner, types.PeerUser):
         return None, None, None
 
-    user = users.get(owner.user_id)
+    user_id = owner.user_id
+    user = users.get(user_id)
 
-    if not user:
-        return str(owner.user_id), None, f"tg://user?id={owner.user_id}"
+    if user:
+        username = getattr(user, "username", None)
 
-    username = getattr(user, "username", None)
+        if username:
+            return (
+                str(user_id),
+                username,
+                f"https://t.me/{username}"
+            )
 
-    if username:
-        return str(owner.user_id), username, f"https://t.me/{username}"
-
-    return str(owner.user_id), None, f"tg://user?id={owner.user_id}"
-
-
-def is_blockchain_gift(gift):
-    return bool(
-        getattr(gift, "gift_address", None)
-        or getattr(gift, "owner_address", None)
+    return (
+        str(user_id),
+        None,
+        f"tg://user?id={user_id}"
     )
 
 
@@ -154,28 +140,49 @@ def get_gift_url(gift):
     return None
 
 
+def get_price(gift):
+    for amount in getattr(gift, "resell_amount", []) or []:
+        name = type(amount).__name__
+
+        if name == "StarsTonAmount":
+            value = getattr(amount, "amount", None)
+
+            if value is not None:
+                return f"{value / 1_000_000_000:.4f} TON"
+
+        if name == "StarsAmount":
+            value = getattr(amount, "amount", None)
+
+            if value is not None:
+                return f"{value} ⭐"
+
+    return "Не определена"
+
+
 async def ask_pricer(client, gift_url):
     if not gift_url:
         return None
 
     try:
-        bot = await client.get_entity(PRICER_USERNAME)
+        pricer = await client.get_entity(PRICER_USERNAME)
 
         async with client.conversation(
-            bot,
-            timeout=35,
+            pricer,
+            timeout=25,
             exclusive=False
         ) as conversation:
             await conversation.send_message(gift_url)
-
             response = await conversation.get_response()
 
             return response.raw_text or ""
 
     except asyncio.TimeoutError:
-        log.warning("PriceNFTbot не ответил вовремя")
+        log.warning("PriceNFTbot не ответил")
     except FloodWaitError as error:
-        log.warning("Telegram ограничил запросы на %s секунд", error.seconds)
+        log.warning(
+            "PriceNFTbot: ожидание %s секунд",
+            error.seconds
+        )
         await asyncio.sleep(error.seconds)
     except Exception:
         log.exception("Ошибка обращения к PriceNFTbot")
@@ -183,58 +190,96 @@ async def ask_pricer(client, gift_url):
     return None
 
 
-def extract_pricer_data(text):
+def extract_floor(text):
     if not text:
-        return {}
+        return None
 
-    data = {}
-
-    username = re.search(r"@([A-Za-z0-9_]{5,32})", text)
-
-    if username:
-        data["owner_username"] = username.group(1)
-        data["owner_url"] = "https://t.me/" + username.group(1)
-
-    ton_values = re.findall(
+    patterns = [
+        r"(?:floor|флор)[^\d]{0,30}(\d+(?:[.,]\d+)?)\s*TON",
+        r"(?:минимальная цена|минимум)[^\d]{0,30}"
         r"(\d+(?:[.,]\d+)?)\s*TON",
-        text,
-        flags=re.IGNORECASE
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+
+        if match:
+            try:
+                return float(match.group(1).replace(",", "."))
+            except ValueError:
+                pass
+
+    return None
+
+
+def extract_pricer_owner(text):
+    if not text:
+        return None, None
+
+    match = re.search(
+        r"@([A-Za-z0-9_]{5,32})",
+        text
     )
 
-    if ton_values:
-        data["pricer_ton_values"] = [
-            float(value.replace(",", ".")) for value in ton_values
-        ]
+    if not match:
+        return None, None
 
-    return data
+    username = match.group(1)
+
+    return username, f"https://t.me/{username}"
 
 
-def format_listing(gift, owner, username, owner_url, attributes, price, floor):
-    title = getattr(gift, "title", None) or "Telegram Gift"
+def make_listing(
+    gift,
+    owner_id,
+    username,
+    gift_url,
+    attributes,
+    price,
+    floor
+):
+    title = html.escape(
+        getattr(gift, "title", None) or "Telegram Gift"
+    )
 
-    owner_text = (
-        f"@{username}" if username
-        else f"ID: {owner}" if owner
+    if username:
+        owner_text = "@" + html.escape(username)
+    elif owner_id:
+        owner_text = "ID: " + html.escape(str(owner_id))
+    else:
+        owner_text = "Не определён"
+
+    floor_text = (
+        f"{floor:.4f} TON"
+        if floor is not None
         else "Не определён"
     )
 
-    floor_text = f"{floor:.4f} TON" if floor is not None else "Не определён"
+    gift_link = (
+        f'<a href="{html.escape(gift_url, quote=True)}">'
+        f"Открыть подарок</a>"
+        if gift_url
+        else "Ссылка отсутствует"
+    )
 
     return (
         f"🎁 <b>{title}</b>\n\n"
-        f"💰 Цена: {price}\n"
+        f"💰 Цена: {html.escape(price)}\n"
         f"📊 Флор: {floor_text}\n\n"
-        f"🎨 Модель: {attributes['model'] or 'Не определена'}\n"
-        f"🖼 Фон: {attributes['backdrop'] or 'Не определён'}\n"
-        f"🔹 Узоры: {attributes['pattern'] or 'Не определены'}\n\n"
+        f"🎨 Модель: "
+        f"{html.escape(attributes['model'] or 'Не определена')}\n"
+        f"🖼 Фон: "
+        f"{html.escape(attributes['backdrop'] or 'Не определён')}\n"
+        f"🔹 Узоры: "
+        f"{html.escape(attributes['pattern'] or 'Не определены')}\n\n"
         f"👤 Владелец: {owner_text}\n"
-        f"🔗 Подарок: {get_gift_url(gift) or 'Ссылка отсутствует'}"
+        f"🔗 {gift_link}"
     )
 
 
-async def publish_gift(client, gift, topics, users):
+async def publish_gift(client, bot, gift, topics, users):
     if is_blockchain_gift(gift):
-        log.info("Пропущен подарок из блокчейна: %s", gift.id)
+        log.info("Пропуск блокчейн-подарка: %s", gift.id)
         return
 
     gift_id = str(gift.id)
@@ -242,76 +287,85 @@ async def publish_gift(client, gift, topics, users):
     if database.gift_exists(gift_id):
         return
 
-    attributes = extract_attributes(gift)
+    attributes = get_attributes(gift)
     owner_id, username, owner_url = get_owner(gift, users)
 
     gift_url = get_gift_url(gift)
-    price = get_gift_price(gift)
+    price = get_price(gift)
 
-    pricer_response = await ask_pricer(client, gift_url)
-    pricer_data = extract_pricer_data(pricer_response)
+    pricer_text = await ask_pricer(client, gift_url)
 
-    if not username and pricer_data.get("owner_username"):
-        username = pricer_data["owner_username"]
-        owner_url = pricer_data["owner_url"]
+    floor = extract_floor(pricer_text)
 
-    floor = None
+    if not username:
+        pricer_username, pricer_url = extract_pricer_owner(
+            pricer_text
+        )
 
-    values = pricer_data.get("pricer_ton_values", [])
-
-    if values:
-        floor = min(values)
+        if pricer_username:
+            username = pricer_username
+            owner_url = pricer_url
 
     category = get_topic_for_floor(floor)
     topic_id = topics[category]
 
-    title = getattr(gift, "title", None) or "Telegram Gift"
-
-    database.save_gift({
-        "gift_id": gift_id,
-        "title": title,
-        "gift_url": gift_url,
-        "owner_id": owner_id,
-        "owner_username": username,
-        "owner_url": owner_url,
-        "price": price,
-        "floor": floor,
-        "model": attributes["model"],
-        "backdrop": attributes["backdrop"],
-        "pattern": attributes["pattern"],
-        "topic_id": topic_id,
-    })
-
-    text = format_listing(
+    text = make_listing(
         gift,
         owner_id,
         username,
-        owner_url,
+        gift_url,
         attributes,
         price,
         floor
     )
 
     try:
-        entity = await client.get_entity(GROUP_ID)
-
-        message = await client.send_message(
-            entity,
-            text,
-            reply_to=topic_id,
-            parse_mode="html",
-            link_preview=False
+        message = await bot.send_message(
+            chat_id=GROUP_ID,
+            message_thread_id=topic_id,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True
         )
 
-        database.mark_published(gift_id, topic_id, message.id)
+        database.save_gift({
+            "gift_id": gift_id,
+            "title": getattr(gift, "title", None)
+                     or "Telegram Gift",
+            "gift_url": gift_url,
+            "owner_id": owner_id,
+            "owner_username": username,
+            "owner_url": owner_url,
+            "price": price,
+            "floor": floor,
+            "model": attributes["model"],
+            "backdrop": attributes["backdrop"],
+            "pattern": attributes["pattern"],
+            "topic_id": topic_id,
+            "message_id": message.message_id,
+            "status": "published",
+        })
 
-        log.info("Опубликован подарок %s", gift_id)
+        database.mark_published(
+            gift_id,
+            topic_id,
+            message.message_id
+        )
+
+        log.info(
+            "Опубликован подарок %s в тему %s",
+            gift_id,
+            category
+        )
 
     except Exception:
-        log.exception("Не удалось опубликовать подарок %s", gift_id)
+        log.exception(
+            "Ошибка публикации подарка %s",
+            gift_id
+        )
 
 
-async def scan_collection(client, topics, base_gift):
+async def scan_collection(client, bot, topics, base_gift):
     offset = ""
 
     while True:
@@ -326,15 +380,22 @@ async def scan_collection(client, topics, base_gift):
             )
 
         except FloodWaitError as error:
-            log.warning("FloodWait: %s секунд", error.seconds)
+            log.warning(
+                "Telegram FloodWait: %s секунд",
+                error.seconds
+            )
             await asyncio.sleep(error.seconds)
             continue
 
         except Exception:
-            log.exception("Ошибка получения страницы коллекции")
-            break
+            log.exception(
+                "Ошибка получения коллекции %s",
+                base_gift.id
+            )
+            return
 
         gifts = getattr(result, "gifts", []) or []
+
         users = {
             user.id: user
             for user in getattr(result, "users", []) or []
@@ -343,12 +404,29 @@ async def scan_collection(client, topics, base_gift):
         if not gifts:
             break
 
+        log.info(
+            "Коллекция %s: получено %s подарков",
+            getattr(base_gift, "title", base_gift.id),
+            len(gifts)
+        )
+
         for gift in gifts:
             try:
-                await publish_gift(client, gift, topics, users)
+                await publish_gift(
+                    client,
+                    bot,
+                    gift,
+                    topics,
+                    users
+                )
+
                 await asyncio.sleep(1)
+
             except Exception:
-                log.exception("Ошибка обработки подарка")
+                log.exception(
+                    "Ошибка обработки подарка %s",
+                    getattr(gift, "id", "?")
+                )
 
         next_offset = getattr(result, "next_offset", None)
 
@@ -358,7 +436,7 @@ async def scan_collection(client, topics, base_gift):
         offset = next_offset
 
 
-async def scan_once(client):
+async def scan_once(client, bot):
     topics = await discover_topics(client)
 
     catalog = await client(
@@ -367,7 +445,10 @@ async def scan_once(client):
 
     collections = getattr(catalog, "gifts", []) or []
 
-    log.info("Коллекций в каталоге: %s", len(collections))
+    log.info(
+        "Найдено коллекций в каталоге: %s",
+        len(collections)
+    )
 
     for base_gift in collections:
         try:
@@ -376,20 +457,28 @@ async def scan_once(client):
                 getattr(base_gift, "title", base_gift.id)
             )
 
-            await scan_collection(client, topics, base_gift)
+            await scan_collection(
+                client,
+                bot,
+                topics,
+                base_gift
+            )
 
         except Exception:
-            log.exception("Ошибка коллекции %s", base_gift.id)
+            log.exception(
+                "Ошибка коллекции %s",
+                base_gift.id
+            )
 
 
-async def run_scanner(client):
+async def run_scanner(client, bot):
     while True:
         try:
-            log.info("Начинаем новый цикл сканирования")
-            await scan_once(client)
-            log.info("Сканирование завершено")
+            log.info("Начало сканирования")
+            await scan_once(client, bot)
+            log.info("Цикл сканирования завершён")
 
         except Exception:
-            log.exception("Ошибка главного цикла сканера")
+            log.exception("Ошибка главного цикла")
 
         await asyncio.sleep(SCAN_INTERVAL)
