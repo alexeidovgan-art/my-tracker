@@ -5,6 +5,8 @@ import logging
 import re
 import unicodedata
 
+from decimal import Decimal, InvalidOperation
+
 from telethon import functions, types
 from telethon.tl.functions.messages import GetForumTopicsRequest
 from telethon.errors import FloodWaitError
@@ -126,23 +128,67 @@ def get_owner(gift, users):
 
 
 def get_ton_price(gift):
-    amount = get_value(gift, "resell_amount")
+    """
+    Telegram возвращает resell_amount как список StarsAmount.
 
-    if amount is None:
+    StarsTonAmount.amount хранит цену в нанограммах.
+    1 TON = 1 000 000 000 нанограммов.
+
+    StarsAmount — цена в Telegram Stars, её нельзя
+    ошибочно считать ценой в TON.
+    """
+
+    amounts = get_value(gift, "resell_amount")
+
+    if amounts is None:
         return None
 
-    class_name = amount.__class__.__name__.lower()
+    if not isinstance(amounts, (list, tuple)):
+        amounts = [amounts]
 
-    if "ton" not in class_name:
-        return None
+    for amount_obj in amounts:
+        if amount_obj is None:
+            continue
 
-    whole = get_value(amount, "amount") or 0
-    nanos = get_value(amount, "nanos") or 0
+        class_name = amount_obj.__class__.__name__.lower()
 
-    try:
-        return float(whole) + float(nanos) / 1_000_000_000
-    except (TypeError, ValueError):
-        return None
+        # Ищем именно TON-вариант, не StarsAmount.
+        if "ton" not in class_name:
+            continue
+
+        raw_amount = get_value(amount_obj, "amount")
+
+        if raw_amount is None:
+            continue
+
+        try:
+            nanograms = Decimal(str(raw_amount))
+            ton_price = nanograms / Decimal("1000000000")
+
+            if ton_price > 0:
+                return float(ton_price)
+
+        except (InvalidOperation, TypeError, ValueError):
+            log.warning(
+                "Не удалось преобразовать TON-цену: %r",
+                raw_amount
+            )
+
+    # Диагностика: показываем реальные типы,
+    # если Telegram не вернул вариант цены в TON.
+    amount_types = [
+        item.__class__.__name__
+        for item in amounts
+        if item is not None
+    ]
+
+    log.debug(
+        "Для подарка %s нет цены TON. Типы resell_amount: %s",
+        get_gift_key(gift),
+        amount_types
+    )
+
+    return None
 
 
 def extract_floor(text):
@@ -182,7 +228,10 @@ async def ask_pricer(client, gift_url):
             return extract_floor(response.raw_text or "")
 
     except asyncio.TimeoutError:
-        log.warning("PriceNFTbot не ответил: %s", gift_url)
+        log.warning(
+            "PriceNFTbot не ответил: %s",
+            gift_url
+        )
 
     except Exception:
         log.exception("Ошибка обращения к PriceNFTbot")
@@ -247,7 +296,10 @@ async def discover_topics(client):
             "В группе не найдены темы: " + ", ".join(missing)
         )
 
-    log.info("Все три темы успешно найдены: %s", topics)
+    log.info(
+        "Все три темы успешно найдены: %s",
+        topics
+    )
 
     return topics
 
@@ -296,7 +348,10 @@ async def publish_gift(client, bot, gift, users, topics):
     price = get_ton_price(gift)
 
     if price is None:
-        log.info("Пропущен подарок без цены TON: %s", gift_key)
+        log.info(
+            "Пропущен подарок без цены TON: %s",
+            gift_key
+        )
         return
 
     attrs = get_attributes(gift)
@@ -358,7 +413,10 @@ async def publish_gift(client, bot, gift, users, topics):
         )
 
     except Exception:
-        log.exception("Ошибка публикации подарка %s", gift_key)
+        log.exception(
+            "Ошибка публикации подарка %s",
+            gift_key
+        )
 
 
 async def scan_collection(client, bot, base_gift, topics):
@@ -450,7 +508,9 @@ async def scan_once(client, bot):
             await asyncio.sleep(error.seconds + 1)
 
         except Exception:
-            log.exception("Ошибка обработки типа подарка")
+            log.exception(
+                "Ошибка обработки типа подарка"
+            )
 
     log.info("Сканирование завершено")
 
@@ -466,6 +526,8 @@ async def run_scanner(client, bot):
             raise
 
         except Exception:
-            log.exception("Ошибка основного цикла сканера")
+            log.exception(
+                "Ошибка основного цикла сканера"
+            )
 
         await asyncio.sleep(SCAN_INTERVAL)
