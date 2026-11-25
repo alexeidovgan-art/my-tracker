@@ -2,8 +2,11 @@
 import asyncio
 import logging
 import os
+
 from aiohttp import web
 from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telegram import Bot
 
 import database
 from scanner import run_scanner
@@ -17,12 +20,12 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 
-def get_required_env(name):
+def required_env(name):
     value = os.getenv(name)
-
     if not value:
-        raise RuntimeError(f"Не задана переменная Render: {name}")
-
+        raise RuntimeError(
+            f"Не задана переменная Render: {name}"
+        )
     return value
 
 
@@ -45,49 +48,54 @@ async def start_health_server():
 
     site = web.TCPSite(
         runner,
-        host="0.0.0.0",
-        port=port
+        "0.0.0.0",
+        port
     )
 
     await site.start()
 
-    log.info("Health server запущен на порту %s", port)
+    log.info("Health server запущен: %s", port)
 
     return runner
 
 
 async def main():
-    api_id = int(get_required_env("API_ID"))
-    api_hash = get_required_env("API_HASH")
-    session_string = get_required_env("TG_SESSION")
+    api_id = int(required_env("API_ID"))
+    api_hash = required_env("API_HASH")
+    session_string = required_env("TG_SESSION")
+    bot_token = required_env("BOT_TOKEN")
 
     database.init_db()
 
-    client = TelegramClient(
-        "tracker_session",
+    user_client = TelegramClient(
+        StringSession(session_string),
         api_id,
         api_hash
     )
 
-    await client.connect()
+    bot = Bot(token=bot_token)
 
-    if not await client.is_user_authorized():
-        await client.disconnect()
+    await user_client.connect()
+
+    if not await user_client.is_user_authorized():
+        await user_client.disconnect()
         raise RuntimeError(
-            "TG_SESSION не авторизована. Проверь строку сессии."
+            "Telegram-сессия не авторизована."
         )
 
-    me = await client.get_me()
+    me = await user_client.get_me()
 
     log.info(
         "Telegram подключён: %s",
         getattr(me, "username", None) or me.id
     )
 
+    await bot.initialize()
+
     health_runner = await start_health_server()
 
     scanner_task = asyncio.create_task(
-        run_scanner(client),
+        run_scanner(user_client, bot),
         name="gift-scanner"
     )
 
@@ -103,13 +111,11 @@ async def main():
             pass
 
         await health_runner.cleanup()
-        await client.disconnect()
+        await bot.shutdown()
+        await user_client.disconnect()
 
         log.info("Трекер остановлен")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Получена команда остановки")
+    asyncio.run(main())
