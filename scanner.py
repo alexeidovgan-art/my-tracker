@@ -141,34 +141,12 @@ def get_ton_price(gift):
     return None
 
 
-def extract_floor(text):
-    if not text:
-        return None
-
-    patterns = [
-        r"floor(?:\s+price)?\s*[:：—-]?\s*([\d.,]+)\s*TON",
-        r"флор(?:\s+цена)?\s*[:：—-]?\s*([\d.,]+)\s*TON",
-        r"([\d.,]+)\s*TON\s*(?:floor|флор)",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-
-        if match:
-            try:
-                return float(match.group(1).replace(",", "."))
-            except ValueError:
-                pass
-
-    return None
+def get_floor(prices):
+    valid = [price for price in prices if price and price > 0]
+    return min(valid) if valid else None
 
 
 def extract_profile_url(message):
-    """
-    Ссылка владельца находится в сущности-ссылке первого слова.
-    Не составляем URL из отображаемого имени.
-    """
-
     text = message.raw_text or ""
 
     for entity in getattr(message, "entities", []) or []:
@@ -187,8 +165,8 @@ def extract_profile_url(message):
             if candidate.startswith("https://t.me/"):
                 return candidate
 
-    # Дополнительная проверка: иногда ссылка присутствует прямо в тексте.
     first_line = text.splitlines()[0] if text else ""
+
     match = re.search(
         r"https?://t\.me/[A-Za-z0-9_]{5,32}",
         first_line
@@ -203,10 +181,12 @@ def extract_profile_url(message):
 def get_username_from_url(url):
     try:
         parsed = urlparse(url)
+
         if parsed.netloc.lower() not in ("t.me", "www.t.me"):
             return None
 
         path = parsed.path.strip("/")
+
         if not path or "/" in path:
             return None
 
@@ -223,11 +203,6 @@ def get_username_from_url(url):
 
 
 async def verify_owner(client, profile_url):
-    """
-    Проверяем, что ссылка ведёт на существующего обычного пользователя,
-    а не на удалённый аккаунт, канал или бота.
-    """
-
     username = get_username_from_url(profile_url)
 
     if not username:
@@ -250,35 +225,25 @@ async def verify_owner(client, profile_url):
         if not actual_username:
             return None
 
+        name = (
+            clean(get_value(entity, "first_name"))
+            or clean(get_value(entity, "last_name"))
+            or actual_username
+        )
+
         return {
             "id": entity.id,
             "username": actual_username,
-            "name": (
-                clean(get_value(entity, "first_name"))
-                or clean(get_value(entity, "last_name"))
-                or actual_username
-            ),
+            "name": name,
             "url": f"https://t.me/{actual_username}",
         }
 
     except Exception as error:
-        log.warning(
-            "Не удалось проверить профиль %s: %s",
-            profile_url,
-            error
-        )
+        log.warning("Не удалось проверить владельца %s: %s", profile_url, error)
         return None
 
 
 async def ask_pricer(client, gift_url):
-    """
-    1. Отправляем ссылку калькулятору.
-    2. Читаем его первое сообщение.
-    3. Ищем кнопку Get profile.
-    4. Нажимаем только её.
-    5. Ищем новое сообщение с профилем владельца.
-    """
-
     if not gift_url:
         return None
 
@@ -292,8 +257,6 @@ async def ask_pricer(client, gift_url):
 
             await conv.send_message(gift_url)
             first_message = await conv.get_response()
-
-            floor = extract_floor(first_message.raw_text or "")
 
             target_button = None
 
@@ -312,21 +275,20 @@ async def ask_pricer(client, gift_url):
                     break
 
             if target_button is None:
-                log.warning(
-                    "Кнопка Get profile не найдена: %s",
-                    gift_url
-                )
+                log.warning("Кнопка Get profile не найдена: %s", gift_url)
                 return None
 
             i, j = target_button
 
-            # Нажимаем только кнопку получения профиля.
+            # Нажимаем только Get profile.
             await first_message.click(i, j)
 
             profile_message = None
             original_edit_date = first_message.edit_date
 
-            deadline = asyncio.get_running_loop().time() + PRICER_TIMEOUT
+            deadline = (
+                asyncio.get_running_loop().time() + PRICER_TIMEOUT
+            )
 
             while asyncio.get_running_loop().time() < deadline:
                 messages = await client.get_messages(
@@ -336,57 +298,38 @@ async def ask_pricer(client, gift_url):
 
                 for message in messages:
                     if message.id > first_message.id:
-                        candidate_url = extract_profile_url(message)
-
-                        if candidate_url:
+                        if extract_profile_url(message):
                             profile_message = message
                             break
 
                 if profile_message:
                     break
 
-                # Некоторые боты редактируют исходное сообщение вместо нового.
                 updated = await client.get_messages(
                     bot_entity,
                     ids=first_message.id
                 )
 
                 if updated:
-                    updated_message = updated[0] if isinstance(
-                        updated, list
-                    ) else updated
+                    updated_message = (
+                        updated[0] if isinstance(updated, list) else updated
+                    )
 
                     if (
                         updated_message.edit_date
                         and updated_message.edit_date != original_edit_date
+                        and extract_profile_url(updated_message)
                     ):
-                        candidate_url = extract_profile_url(updated_message)
-
-                        if candidate_url:
-                            profile_message = updated_message
-                            break
+                        profile_message = updated_message
+                        break
 
                 await asyncio.sleep(1)
 
             if not profile_message:
-                log.warning(
-                    "Калькулятор не прислал ссылку владельца: %s",
-                    gift_url
-                )
+                log.warning("Не получена ссылка профиля: %s", gift_url)
                 return None
 
-            profile_url = extract_profile_url(profile_message)
-
-            if not floor:
-                floor = extract_floor(profile_message.raw_text or "")
-
-            if not profile_url:
-                return None
-
-            return {
-                "floor": floor,
-                "profile_url": profile_url,
-            }
+            return extract_profile_url(profile_message)
 
     except asyncio.TimeoutError:
         log.warning("Тайм-аут PriceNFTbot: %s", gift_url)
@@ -470,7 +413,7 @@ def make_listing(data):
     )
 
 
-async def publish_gift(client, bot, gift, topics):
+async def publish_gift(client, bot, gift, topics, floor):
     if is_blockchain_gift(gift):
         return False
 
@@ -489,6 +432,23 @@ async def publish_gift(client, bot, gift, topics):
         log.info("Нет TON-цены: %s", gift_key)
         return False
 
+    category = get_category(floor)
+
+    if category not in topics:
+        return False
+
+    profile_url = await ask_pricer(client, gift_url)
+    await asyncio.sleep(PRICER_DELAY)
+
+    if not profile_url:
+        return False
+
+    owner = await verify_owner(client, profile_url)
+
+    if not owner:
+        log.info("Подарок пропущен: профиль не прошёл проверку: %s", gift_key)
+        return False
+
     attrs = get_attributes(gift)
 
     title = (
@@ -496,34 +456,6 @@ async def publish_gift(client, bot, gift, topics):
         or get_value(gift, "title")
         or "Telegram Gift"
     )
-
-    pricer_result = await ask_pricer(client, gift_url)
-    await asyncio.sleep(PRICER_DELAY)
-
-    if not pricer_result:
-        log.warning("Не получен профиль владельца: %s", gift_key)
-        return False
-
-    floor = pricer_result.get("floor")
-    profile_url = pricer_result.get("profile_url")
-
-    if floor is None:
-        log.warning("Не удалось получить floor: %s", gift_key)
-        return False
-
-    owner = await verify_owner(client, profile_url)
-
-    if not owner:
-        log.info(
-            "Подарок пропущен: профиль не прошёл проверку: %s",
-            gift_key
-        )
-        return False
-
-    category = get_category(floor)
-
-    if category not in topics:
-        return False
 
     data = {
         "gift_key": gift_key,
@@ -540,8 +472,6 @@ async def publish_gift(client, bot, gift, topics):
         "category": category,
     }
 
-    # Сначала сохраняем запись, чтобы callback уже знал её ID.
-    database.mark_seen(gift_key)
     row_id = database.save_gift(data)
 
     if not row_id:
@@ -595,12 +525,15 @@ async def scan_collection(client, bot, base_gift, topics, baseline):
 
     offset = ""
     processed_offsets = set()
+
+    new_gifts = []
+    floor_prices = []
+
     page_number = 0
 
+    # Сначала проходим все страницы коллекции и вычисляем её флор.
     while True:
         try:
-            # Без сортировки по цене Telegram отдаёт сначала
-            # подарки с наиболее недавно изменённой ценой.
             result = await client(
                 functions.payments.GetResaleStarGiftsRequest(
                     gift_id=base_gift_id,
@@ -637,23 +570,22 @@ async def scan_collection(client, bot, base_gift, topics, baseline):
             if not gift_key:
                 continue
 
+            if is_blockchain_gift(gift):
+                if baseline:
+                    database.mark_seen(gift_key)
+                continue
+
+            price = get_ton_price(gift)
+
+            if price is not None:
+                floor_prices.append(price)
+
             if baseline:
                 database.mark_seen(gift_key)
                 continue
 
-            if database.is_seen(gift_key):
-                continue
-
-            # Отмечаем до обработки, чтобы ошибка калькулятора
-            # не заставляла бесконечно повторять один и тот же запрос.
-            database.mark_seen(gift_key)
-
-            await publish_gift(
-                client,
-                bot,
-                gift,
-                topics
-            )
+            if not database.is_seen(gift_key):
+                new_gifts.append(gift)
 
         next_offset = getattr(result, "next_offset", None)
 
@@ -662,6 +594,38 @@ async def scan_collection(client, bot, base_gift, topics, baseline):
 
         processed_offsets.add(next_offset)
         offset = next_offset
+
+    if baseline:
+        return
+
+    floor = get_floor(floor_prices)
+
+    if floor is None:
+        log.warning("Не удалось вычислить флор коллекции %s", base_gift_id)
+        return
+
+    log.info(
+        "Коллекция %s: флор %.3f TON | новых подарков: %s",
+        base_gift_id,
+        floor,
+        len(new_gifts)
+    )
+
+    for gift in new_gifts:
+        gift_key = get_gift_key(gift)
+
+        if not gift_key or database.is_seen(gift_key):
+            continue
+
+        database.mark_seen(gift_key)
+
+        await publish_gift(
+            client,
+            bot,
+            gift,
+            topics,
+            floor
+        )
 
 
 async def scan_once(client, bot):
@@ -681,7 +645,7 @@ async def scan_once(client, bot):
 
     if baseline:
         log.info(
-            "Первый запуск: запоминаем текущие объявления без публикации"
+            "Первый запуск: запоминаем существующие объявления без публикации"
         )
 
     for base_gift in base_gifts:
@@ -699,7 +663,7 @@ async def scan_once(client, bot):
             await asyncio.sleep(error.seconds + 1)
 
         except Exception:
-            log.exception("Ошибка обработки типа подарка")
+            log.exception("Ошибка обработки коллекции")
 
     if baseline:
         database.set_baseline_done()
