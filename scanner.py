@@ -1,4 +1,3 @@
-
 import asyncio
 import html
 import logging
@@ -6,10 +5,12 @@ import re
 import unicodedata
 
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlparse
 
 from telethon import functions, types
-from telethon.tl.functions.messages import GetForumTopicsRequest
 from telethon.errors import FloodWaitError
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import database
 
@@ -32,6 +33,7 @@ PRICE_MEDIUM = 50
 
 PRICER_USERNAME = "PriceNFTbot"
 PRICER_DELAY = 2.5
+PRICER_TIMEOUT = 35
 
 
 def clean(value):
@@ -103,41 +105,7 @@ def is_blockchain_gift(gift):
     )
 
 
-def get_owner(gift, users):
-    owner_id = get_value(gift, "owner_id")
-
-    if isinstance(owner_id, types.PeerUser):
-        owner_id = owner_id.user_id
-
-    if not owner_id:
-        return "Неизвестен", ""
-
-    for user in users or []:
-        if getattr(user, "id", None) == owner_id:
-            username = get_value(user, "username")
-
-            if username:
-                return f"@{username}", f"https://t.me/{username}"
-
-            return (
-                f"ID {owner_id}",
-                f"tg://user?id={owner_id}"
-            )
-
-    return f"ID {owner_id}", f"tg://user?id={owner_id}"
-
-
 def get_ton_price(gift):
-    """
-    Telegram возвращает resell_amount как список StarsAmount.
-
-    StarsTonAmount.amount хранит цену в нанограммах.
-    1 TON = 1 000 000 000 нанограммов.
-
-    StarsAmount — цена в Telegram Stars, её нельзя
-    ошибочно считать ценой в TON.
-    """
-
     amounts = get_value(gift, "resell_amount")
 
     if amounts is None:
@@ -152,7 +120,6 @@ def get_ton_price(gift):
 
         class_name = amount_obj.__class__.__name__.lower()
 
-        # Ищем именно TON-вариант, не StarsAmount.
         if "ton" not in class_name:
             continue
 
@@ -163,30 +130,13 @@ def get_ton_price(gift):
 
         try:
             nanograms = Decimal(str(raw_amount))
-            ton_price = nanograms / Decimal("1000000000")
+            price = nanograms / Decimal("1000000000")
 
-            if ton_price > 0:
-                return float(ton_price)
+            if price > 0:
+                return float(price)
 
         except (InvalidOperation, TypeError, ValueError):
-            log.warning(
-                "Не удалось преобразовать TON-цену: %r",
-                raw_amount
-            )
-
-    # Диагностика: показываем реальные типы,
-    # если Telegram не вернул вариант цены в TON.
-    amount_types = [
-        item.__class__.__name__
-        for item in amounts
-        if item is not None
-    ]
-
-    log.debug(
-        "Для подарка %s нет цены TON. Типы resell_amount: %s",
-        get_gift_key(gift),
-        amount_types
-    )
+            log.warning("Ошибка преобразования TON-цены: %r", raw_amount)
 
     return None
 
@@ -213,25 +163,233 @@ def extract_floor(text):
     return None
 
 
+def extract_profile_url(message):
+    """
+    Ссылка владельца находится в сущности-ссылке первого слова.
+    Не составляем URL из отображаемого имени.
+    """
+
+    text = message.raw_text or ""
+
+    for entity in getattr(message, "entities", []) or []:
+        if getattr(entity, "offset", -1) != 0:
+            continue
+
+        url = getattr(entity, "url", None)
+
+        if url:
+            return url
+
+        if entity.__class__.__name__ == "MessageEntityUrl":
+            length = getattr(entity, "length", 0)
+            candidate = text[:length].strip()
+
+            if candidate.startswith("https://t.me/"):
+                return candidate
+
+    # Дополнительная проверка: иногда ссылка присутствует прямо в тексте.
+    first_line = text.splitlines()[0] if text else ""
+    match = re.search(
+        r"https?://t\.me/[A-Za-z0-9_]{5,32}",
+        first_line
+    )
+
+    if match:
+        return match.group(0)
+
+    return None
+
+
+def get_username_from_url(url):
+    try:
+        parsed = urlparse(url)
+        if parsed.netloc.lower() not in ("t.me", "www.t.me"):
+            return None
+
+        path = parsed.path.strip("/")
+        if not path or "/" in path:
+            return None
+
+        if path.startswith("+") or path.startswith("joinchat"):
+            return None
+
+        if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", path):
+            return None
+
+        return path
+
+    except Exception:
+        return None
+
+
+async def verify_owner(client, profile_url):
+    """
+    Проверяем, что ссылка ведёт на существующего обычного пользователя,
+    а не на удалённый аккаунт, канал или бота.
+    """
+
+    username = get_username_from_url(profile_url)
+
+    if not username:
+        return None
+
+    try:
+        entity = await client.get_entity(username)
+
+        if not isinstance(entity, types.User):
+            return None
+
+        if getattr(entity, "deleted", False):
+            return None
+
+        if getattr(entity, "bot", False):
+            return None
+
+        actual_username = get_value(entity, "username")
+
+        if not actual_username:
+            return None
+
+        return {
+            "id": entity.id,
+            "username": actual_username,
+            "name": (
+                clean(get_value(entity, "first_name"))
+                or clean(get_value(entity, "last_name"))
+                or actual_username
+            ),
+            "url": f"https://t.me/{actual_username}",
+        }
+
+    except Exception as error:
+        log.warning(
+            "Не удалось проверить профиль %s: %s",
+            profile_url,
+            error
+        )
+        return None
+
+
 async def ask_pricer(client, gift_url):
+    """
+    1. Отправляем ссылку калькулятору.
+    2. Читаем его первое сообщение.
+    3. Ищем кнопку Get profile.
+    4. Нажимаем только её.
+    5. Ищем новое сообщение с профилем владельца.
+    """
+
     if not gift_url:
         return None
 
     try:
-        async with client.conversation(
-            PRICER_USERNAME,
-            timeout=30
-        ) as conv:
-            await conv.send_message(gift_url)
-            response = await conv.get_response()
+        bot_entity = await client.get_entity(PRICER_USERNAME)
 
-            return extract_floor(response.raw_text or "")
+        async with client.conversation(
+            bot_entity,
+            timeout=PRICER_TIMEOUT
+        ) as conv:
+
+            await conv.send_message(gift_url)
+            first_message = await conv.get_response()
+
+            floor = extract_floor(first_message.raw_text or "")
+
+            target_button = None
+
+            for i, row in enumerate(first_message.buttons or []):
+                for j, button in enumerate(row):
+                    button_text = clean(getattr(button, "text", ""))
+
+                    if (
+                        "get profile" in button_text.lower()
+                        or "получить профиль" in button_text.lower()
+                    ):
+                        target_button = (i, j)
+                        break
+
+                if target_button:
+                    break
+
+            if target_button is None:
+                log.warning(
+                    "Кнопка Get profile не найдена: %s",
+                    gift_url
+                )
+                return None
+
+            i, j = target_button
+
+            # Нажимаем только кнопку получения профиля.
+            await first_message.click(i, j)
+
+            profile_message = None
+            original_edit_date = first_message.edit_date
+
+            deadline = asyncio.get_running_loop().time() + PRICER_TIMEOUT
+
+            while asyncio.get_running_loop().time() < deadline:
+                messages = await client.get_messages(
+                    bot_entity,
+                    limit=10
+                )
+
+                for message in messages:
+                    if message.id > first_message.id:
+                        candidate_url = extract_profile_url(message)
+
+                        if candidate_url:
+                            profile_message = message
+                            break
+
+                if profile_message:
+                    break
+
+                # Некоторые боты редактируют исходное сообщение вместо нового.
+                updated = await client.get_messages(
+                    bot_entity,
+                    ids=first_message.id
+                )
+
+                if updated:
+                    updated_message = updated[0] if isinstance(
+                        updated, list
+                    ) else updated
+
+                    if (
+                        updated_message.edit_date
+                        and updated_message.edit_date != original_edit_date
+                    ):
+                        candidate_url = extract_profile_url(updated_message)
+
+                        if candidate_url:
+                            profile_message = updated_message
+                            break
+
+                await asyncio.sleep(1)
+
+            if not profile_message:
+                log.warning(
+                    "Калькулятор не прислал ссылку владельца: %s",
+                    gift_url
+                )
+                return None
+
+            profile_url = extract_profile_url(profile_message)
+
+            if not floor:
+                floor = extract_floor(profile_message.raw_text or "")
+
+            if not profile_url:
+                return None
+
+            return {
+                "floor": floor,
+                "profile_url": profile_url,
+            }
 
     except asyncio.TimeoutError:
-        log.warning(
-            "PriceNFTbot не ответил: %s",
-            gift_url
-        )
+        log.warning("Тайм-аут PriceNFTbot: %s", gift_url)
 
     except Exception:
         log.exception("Ошибка обращения к PriceNFTbot")
@@ -261,7 +419,7 @@ async def discover_topics(client):
     )
 
     result = await client(
-        GetForumTopicsRequest(
+        functions.messages.GetForumTopicsRequest(
             peer=entity,
             offset_date=0,
             offset_id=0,
@@ -275,11 +433,7 @@ async def discover_topics(client):
     for topic in getattr(result, "topics", []):
         title = normalize_topic(get_value(topic, "title"))
 
-        log.info(
-            "Найдена тема: %s | ID: %s",
-            title,
-            topic.id
-        )
+        log.info("Найдена тема: %s | ID: %s", title, topic.id)
 
         for key, expected_name in TOPIC_NAMES.items():
             if title == normalize_topic(expected_name):
@@ -293,13 +447,8 @@ async def discover_topics(client):
 
     if missing:
         raise RuntimeError(
-            "В группе не найдены темы: " + ", ".join(missing)
+            "Не найдены темы группы: " + ", ".join(missing)
         )
-
-    log.info(
-        "Все три темы успешно найдены: %s",
-        topics
-    )
 
     return topics
 
@@ -308,17 +457,6 @@ def make_listing(data):
     def esc(value):
         return html.escape(clean(value) or "Не указано")
 
-    owner = esc(data["owner"])
-    owner_url = data.get("owner_url")
-
-    if owner_url:
-        owner_line = (
-            f'<a href="{html.escape(owner_url, quote=True)}">'
-            f'{owner}</a>'
-        )
-    else:
-        owner_line = owner
-
     return (
         f"🎁 <b>{esc(data['title'])}</b>\n\n"
         f"💰 Цена: <b>{data['price']:.3f} TON</b>\n"
@@ -326,36 +464,32 @@ def make_listing(data):
         f"🎨 Модель: {esc(data['model'])}\n"
         f"🖼 Фон: {esc(data['backdrop'])}\n"
         f"🔣 Узор: {esc(data['pattern'])}\n\n"
-        f"👤 Владелец: {owner_line}\n\n"
+        f"👤 Владелец: {esc(data['owner'])}\n\n"
         f'<a href="{html.escape(data["gift_url"], quote=True)}">'
         f'Открыть подарок</a>'
     )
 
 
-async def publish_gift(client, bot, gift, users, topics):
+async def publish_gift(client, bot, gift, topics):
     if is_blockchain_gift(gift):
-        return
+        return False
 
     gift_key = get_gift_key(gift)
     gift_url = get_gift_url(gift)
 
     if not gift_key or not gift_url:
-        return
+        return False
 
     if database.gift_exists(gift_key):
-        return
+        return False
 
     price = get_ton_price(gift)
 
     if price is None:
-        log.info(
-            "Пропущен подарок без цены TON: %s",
-            gift_key
-        )
-        return
+        log.info("Нет TON-цены: %s", gift_key)
+        return False
 
     attrs = get_attributes(gift)
-    owner, owner_url = get_owner(gift, users)
 
     title = (
         attrs["model"]
@@ -363,27 +497,41 @@ async def publish_gift(client, bot, gift, users, topics):
         or "Telegram Gift"
     )
 
-    floor = await ask_pricer(client, gift_url)
+    pricer_result = await ask_pricer(client, gift_url)
     await asyncio.sleep(PRICER_DELAY)
 
+    if not pricer_result:
+        log.warning("Не получен профиль владельца: %s", gift_key)
+        return False
+
+    floor = pricer_result.get("floor")
+    profile_url = pricer_result.get("profile_url")
+
     if floor is None:
-        log.warning(
-            "Не удалось получить floor: %s",
-            gift_url
+        log.warning("Не удалось получить floor: %s", gift_key)
+        return False
+
+    owner = await verify_owner(client, profile_url)
+
+    if not owner:
+        log.info(
+            "Подарок пропущен: профиль не прошёл проверку: %s",
+            gift_key
         )
-        return
+        return False
 
     category = get_category(floor)
 
     if category not in topics:
-        return
+        return False
 
     data = {
         "gift_key": gift_key,
         "gift_url": gift_url,
         "title": title,
-        "owner": owner,
-        "owner_url": owner_url,
+        "owner": owner["name"],
+        "owner_url": owner["url"],
+        "owner_id": owner["id"],
         "price": price,
         "floor": floor,
         "model": attrs["model"],
@@ -392,18 +540,37 @@ async def publish_gift(client, bot, gift, users, topics):
         "category": category,
     }
 
-    message = make_listing(data)
+    # Сначала сохраняем запись, чтобы callback уже знал её ID.
+    database.mark_seen(gift_key)
+    row_id = database.save_gift(data)
+
+    if not row_id:
+        return False
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "Занять лог",
+                callback_data=f"claim:{row_id}"
+            )
+        ]
+    ])
 
     try:
-        await bot.send_message(
+        message = await bot.send_message(
             chat_id=GROUP_ID,
             message_thread_id=topics[category],
-            text=message,
+            text=make_listing(data),
             parse_mode="HTML",
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
+            reply_markup=keyboard
         )
 
-        database.save_gift(data)
+        database.set_group_message(
+            row_id,
+            GROUP_ID,
+            message.message_id
+        )
 
         log.info(
             "Опубликован %s | цена %.3f TON | floor %.3f TON",
@@ -412,14 +579,15 @@ async def publish_gift(client, bot, gift, users, topics):
             floor
         )
 
+        return True
+
     except Exception:
-        log.exception(
-            "Ошибка публикации подарка %s",
-            gift_key
-        )
+        database.delete_unclaimed_gift(row_id)
+        log.exception("Ошибка публикации подарка %s", gift_key)
+        return False
 
 
-async def scan_collection(client, bot, base_gift, topics):
+async def scan_collection(client, bot, base_gift, topics, baseline):
     base_gift_id = get_value(base_gift, "id")
 
     if not base_gift_id:
@@ -427,42 +595,63 @@ async def scan_collection(client, bot, base_gift, topics):
 
     offset = ""
     processed_offsets = set()
+    page_number = 0
 
     while True:
         try:
+            # Без сортировки по цене Telegram отдаёт сначала
+            # подарки с наиболее недавно изменённой ценой.
             result = await client(
                 functions.payments.GetResaleStarGiftsRequest(
                     gift_id=base_gift_id,
                     offset=offset,
-                    limit=PAGE_SIZE,
-                    sort_by_price=True
+                    limit=PAGE_SIZE
                 )
             )
 
         except FloodWaitError as error:
-            log.warning(
-                "FloodWait: ожидание %s секунд",
-                error.seconds
-            )
+            log.warning("FloodWait: %s секунд", error.seconds)
             await asyncio.sleep(error.seconds + 1)
             continue
 
         except Exception:
             log.exception(
-                "Ошибка получения перепродаж gift_id=%s",
+                "Ошибка получения коллекции gift_id=%s",
                 base_gift_id
             )
             return
 
+        page_number += 1
         gifts = getattr(result, "gifts", []) or []
-        users = getattr(result, "users", []) or []
+
+        log.info(
+            "Коллекция %s | страница %s | подарков: %s",
+            base_gift_id,
+            page_number,
+            len(gifts)
+        )
 
         for gift in gifts:
+            gift_key = get_gift_key(gift)
+
+            if not gift_key:
+                continue
+
+            if baseline:
+                database.mark_seen(gift_key)
+                continue
+
+            if database.is_seen(gift_key):
+                continue
+
+            # Отмечаем до обработки, чтобы ошибка калькулятора
+            # не заставляла бесконечно повторять один и тот же запрос.
+            database.mark_seen(gift_key)
+
             await publish_gift(
                 client,
                 bot,
                 gift,
-                users,
                 topics
             )
 
@@ -486,10 +675,14 @@ async def scan_once(client, bot):
 
     base_gifts = getattr(result, "gifts", []) or []
 
-    log.info(
-        "Найдено типов подарков: %s",
-        len(base_gifts)
-    )
+    log.info("Найдено типов подарков: %s", len(base_gifts))
+
+    baseline = not database.baseline_done()
+
+    if baseline:
+        log.info(
+            "Первый запуск: запоминаем текущие объявления без публикации"
+        )
 
     for base_gift in base_gifts:
         try:
@@ -497,20 +690,20 @@ async def scan_once(client, bot):
                 client,
                 bot,
                 base_gift,
-                topics
+                topics,
+                baseline
             )
 
         except FloodWaitError as error:
-            log.warning(
-                "FloodWait: %s секунд",
-                error.seconds
-            )
+            log.warning("FloodWait: %s секунд", error.seconds)
             await asyncio.sleep(error.seconds + 1)
 
         except Exception:
-            log.exception(
-                "Ошибка обработки типа подарка"
-            )
+            log.exception("Ошибка обработки типа подарка")
+
+    if baseline:
+        database.set_baseline_done()
+        log.info("Первичная база объявлений заполнена")
 
     log.info("Сканирование завершено")
 
@@ -526,8 +719,6 @@ async def run_scanner(client, bot):
             raise
 
         except Exception:
-            log.exception(
-                "Ошибка основного цикла сканера"
-            )
+            log.exception("Ошибка основного цикла сканера")
 
         await asyncio.sleep(SCAN_INTERVAL)
